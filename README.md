@@ -28,10 +28,13 @@ The Flex Web Service is the official way to get your own statements as data, but
 documentation does not make obvious. This tool handles them:
 
 - **One request covers at most 365 days**, so a long history is fetched a year at a time.
-- **It serves completed days only.** A range ending today is refused, so the default end is
-  yesterday.
+- **It serves completed weekdays only.** A range ending today, or on a Saturday or Sunday, is
+  refused, so the default end is the last weekday before today.
 - **Before an account existed, it answers error 1003, "Statement is not available".** That is
-  treated as "no data for this period", not as a failure.
+  treated as "no data for this period", not as a failure. The same error on a period already in
+  `cash.json` (a bank holiday, say) keeps the rows on file instead of erasing them.
+- **One account refused outright does not stop the others.** An expired token, or IBKR's "Too many
+  failed attempts" after repeated retries, leaves that account's rows from the last run in place.
 - **A token belongs to your login, not to one account.** If you have several accounts, or an old
   one that was migrated into a new one, one token serves them all, with a query each. A closed or
   migrated account usually still answers.

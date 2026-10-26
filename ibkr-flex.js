@@ -83,28 +83,54 @@ async function fetchWindow({ token, query }, w, fetchImpl = fetch) {
     throw new Error('IBKR kept refusing: too many requests from this token; try again later');
 }
 
+// The last day IBKR has a statement for: yesterday, stepped back over a weekend. Flex serves
+// completed days only, and a Saturday or Sunday has no statement: a window ending on one is refused
+// with 1003, exactly like a period before the account existed.
+function lastServedDay(now = new Date()) {
+    let d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - DAY);
+    while (d.getUTCDay() === 0 || d.getUTCDay() === 6) d = new Date(d.getTime() - DAY);
+    return ymd(d);
+}
+
+// A window IBKR refuses that the file already holds rows for is a refusal (a bank holiday, a
+// weekend), not an empty period. Keep the stored rows for the window starting on the same day,
+// whatever end it was fetched to, rather than replace them with nothing.
+function keptOnRefusal(was, w) {
+    const prev = Object.entries(was || {}).find(([k, v]) => k.startsWith(w.from + '/') && v && v.rows && v.rows.length);
+    return prev ? prev[1] : null;
+}
+
 async function fetchAll(args) {
     const opt = name => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : null; };
     const out = opt('--out') || 'cash.json';
     const prev = fs.existsSync(out) ? JSON.parse(fs.readFileSync(out, 'utf8')) : { accounts: {} };
     const from = opt('--from') || prev.from;
     if (!from) throw new Error('first run: give --from YYYY-MM-DD, the day your account opened (or earlier)');
-    const to = opt('--to') || ymd(new Date(Date.now() - DAY));       // completed days only
+    const to = opt('--to') || lastServedDay();                       // completed weekdays only
     const accounts = readConfig(opt('--config') || 'ibkr-flex.json');
     const ws = windows(from, to);
     const result = { from, to, fetched: new Date().toISOString(), accounts: {} };
     for (const acct of accounts) {
         const was = prev.accounts?.[acct.name]?.windows || {}, cached = {};
-        for (const [i, w] of ws.entries()) {
-            const key = `${w.from}/${w.to}`;
-            // A finished window cannot change; the last two are asked again for late postings.
-            if (i < ws.length - 2 && was[key]) { cached[key] = was[key]; continue; }
-            const rows = await fetchWindow(acct, w);
-            cached[key] = rows ? { rows } : { unavailable: true };
-            console.error(`${acct.name} ${key}: ${rows ? rows.length + ' rows' : 'not available'}`);
-            await wait(2000);
+        try {
+            for (const [i, w] of ws.entries()) {
+                const key = `${w.from}/${w.to}`;
+                // A finished window cannot change; the last two are asked again for late postings.
+                if (i < ws.length - 2 && was[key]) { cached[key] = was[key]; continue; }
+                const rows = await fetchWindow(acct, w);
+                const kept = rows ? null : keptOnRefusal(was, w);
+                cached[key] = rows ? { rows } : kept || { unavailable: true };
+                console.error(`${acct.name} ${key}: ${rows ? rows.length + ' rows' : kept ? `refused; kept the ${kept.rows.length} rows on file` : 'not available'}`);
+                await wait(2000);
+            }
+            result.accounts[acct.name] = { windows: cached };
+        } catch (e) {
+            // One account refused outright (an expired token, or "Too many failed attempts" after
+            // repeated retries) must not cost the others their fresh rows. Keep what the file had.
+            if (!prev.accounts?.[acct.name]) throw e;
+            result.accounts[acct.name] = prev.accounts[acct.name];
+            console.error(`${acct.name}: ${e.message}; kept its rows from the last run`);
         }
-        result.accounts[acct.name] = { windows: cached };
     }
     fs.writeFileSync(out, JSON.stringify(result, null, 1));
     console.error(`wrote ${out}: ${allRows(result).length} rows`);
@@ -162,6 +188,16 @@ async function selftest() {
         ['2024-10-10/2025-10-09', '2025-10-10/2026-10-08']);
     assert.deepStrictEqual(windows('2026-10-08', '2026-10-08'), [{ from: '2026-10-08', to: '2026-10-08' }]);
 
+    // The newest window ends on a weekday: IBKR has no statement for a Saturday or Sunday.
+    assert.strictEqual(lastServedDay(new Date('2026-10-25T23:00:00Z')), '2026-10-23', 'Sunday: back to Friday');
+    assert.strictEqual(lastServedDay(new Date('2026-10-26T08:00:00Z')), '2026-10-23', 'Monday: Friday');
+    assert.strictEqual(lastServedDay(new Date('2026-10-28T08:00:00Z')), '2026-10-27', 'Wednesday: Tuesday');
+    // A refused window keeps the rows already on file for the window starting that day.
+    const onFile = { '2026-04-18/2026-10-22': { rows: [{ symbol: 'MC' }] } };
+    assert.strictEqual(keptOnRefusal(onFile, { from: '2026-04-18', to: '2026-10-24' }), onFile['2026-04-18/2026-10-22']);
+    assert.strictEqual(keptOnRefusal({ '2026-04-18/2026-10-22': { unavailable: true } }, { from: '2026-04-18' }), null);
+    assert.strictEqual(keptOnRefusal(onFile, { from: '2025-04-18' }), null, 'a different window');
+
     const xml = '<FlexQueryResponse><FlexStatements><FlexStatement accountId="U1">'
         + '<CashTransaction accountId="U1" currency="EUR" symbol="MC" isin="FR0000121014" description="MC CASH DIVIDEND EUR 5.50 &amp; MORE" dateTime="20251204;202000" exDate="20251202" amount="27.5" type="Dividends" />'
         + '<CashTransaction accountId="U1" currency="EUR" symbol="MC" isin="FR0000121014" dateTime="20251204;202000" exDate="20251202" amount="-6.875" type="Withholding Tax" />'
@@ -199,4 +235,4 @@ if (require.main === module) {
     const run = process.argv.includes('--selftest') ? selftest() : main(process.argv.slice(2));
     Promise.resolve(run).catch(e => { console.error(e.message); process.exitCode = 1; });
 }
-module.exports = { readConfig, windows, parseRows, fetchWindow, summarise, allRows };
+module.exports = { readConfig, windows, parseRows, fetchWindow, summarise, allRows, lastServedDay, keptOnRefusal };
